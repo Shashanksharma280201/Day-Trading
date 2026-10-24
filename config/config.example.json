@@ -1,0 +1,40 @@
+{
+  "_readme": "Copy to config/config.json and edit. config.json is git-ignored. Never put API keys or passwords in this file: they go in environment variables on your server.",
+  "mode": "paper",
+  "strategy": {
+    "name": "orb",
+    "params": {
+      "range_minutes": 15,
+      "reward_risk": 2.0,
+      "min_range_pct": 0.3,
+      "max_range_pct": 2.5,
+      "max_signals_per_day": 1
+    }
+  },
+  "risk": {
+    "capital": 100000,
+    "risk_per_trade_pct": 0.5,
+    "max_position_pct": 20,
+    "daily_loss_limit_pct": 2,
+    "max_trades_per_day": 5,
+    "max_open_positions": 2,
+    "no_entry_before": "09:20",
+    "no_entry_after": "14:45",
+    "square_off_at": "15:10",
+    "allow_short": true,
+    "allow_fno": false,
+    "blocked_symbols": [],
+    "max_orders_per_second": 5
+  },
+  "charges": {
+    "brokerage_pct": 0.0003,
+    "brokerage_cap": 20,
+    "stt_sell_pct": 0.00025,
+    "exchange_pct": 0.0000307,
+    "sebi_per_crore": 10,
+    "gst_pct": 0.18,
+    "stamp_buy_pct": 0.00003
+  },
+  "slippage_bps": 2,
+  "watchlist": ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS"]
+}

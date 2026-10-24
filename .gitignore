@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# your own settings and secrets never go to GitHub
+config/config.json
+.env
+*.key
+
+# market data and results can be large and are yours
+data/
+results/
+*.log
