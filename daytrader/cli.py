@@ -90,6 +90,123 @@ def cmd_compare(a, cfg):
               f"{s['total_costs']:>10,.0f} {s['net_pnl']:>12,.0f} {s['max_drawdown_pct']:>7}")
 
 
+def cmd_serve(a, cfg):
+    import signal
+    import threading
+
+    from .broker import PaperBroker
+    from .engine import Engine, EngineConfig
+    from .feeds import GrowwFeed, ReplayFeed
+    from .server import ApprovalServer, load_or_create_token
+
+    ecfg = EngineConfig.from_dict(cfg.get("engine"))
+    ecfg.mode = cfg.get("mode", "paper")
+    risk = RiskConfig.from_dict(cfg.get("risk"))
+    charges = ChargeSchedule.from_dict(cfg.get("charges"))
+    strat = strategies.build(cfg["strategy"]["name"], cfg["strategy"].get("params", {}))
+
+    if a.live or ecfg.mode == "live":
+        if not (a.live and ecfg.mode == "live"):
+            sys.exit("Live trading needs BOTH \"mode\": \"live\" in config.json AND the --live flag.")
+        if a.feed != "groww":
+            sys.exit("Live trading needs --feed groww.")
+        from .broker.groww import GrowwBroker, client_from_env
+        client = client_from_env()
+        broker = GrowwBroker(client, risk.max_orders_per_second)
+        print("LIVE MODE: approved orders go to your real Groww account. "
+              "Make sure this machine uses the static IP registered with Groww.")
+    else:
+        broker = PaperBroker(risk.capital, charges, cfg.get("slippage_bps", 2))
+        client = None
+
+    if a.feed == "replay":
+        if not a.data:
+            sys.exit("--feed replay needs --data path/to/bars.csv")
+        feed = ReplayFeed(a.data, speed=a.speed, loop=a.loop)
+    else:
+        if client is None:
+            from .broker.groww import client_from_env
+            client = client_from_env()
+        feed = GrowwFeed(client, a.symbols.split(",") if a.symbols else cfg.get("watchlist", []))
+
+    engine = Engine(strat, risk, broker, ecfg, charges)
+    token = load_or_create_token(ecfg.state_dir)
+    server = ApprovalServer(engine, token, a.host, a.port)
+    server.start()
+    host, port = server.address
+    print(f"Mode: {ecfg.mode.upper()}  feed: {a.feed}  strategy: {strat.name}")
+    print(f"Approval server: http://{host}:{port}  (token in {ecfg.state_dir}/api_token)")
+    print(f"Approvals expire after {ecfg.approval_ttl:g}s; stale if price moves over {ecfg.max_drift_pct}%.")
+    if a.print_token:
+        print(f"Token: {token}")
+
+    def on_event(ev):
+        t, d = ev["type"], ev["data"]
+        if t == "proposal":
+            print(f"[APPROVAL NEEDED] {d['id']} {d['side']} {d['qty']} {d['symbol']} @ ~{d['ref_price']} "
+                  f"stop {d['stop']} target {d['target']} risk Rs {d['risk_rupees']}")
+        elif t in ("proposal_update", "position_opened", "position_closed", "killed", "alert", "feed"):
+            print(f"[{t}] {json.dumps(d, default=str)}")
+
+    engine.subscribe(on_event)
+    t = threading.Thread(target=feed.run, args=(engine,), daemon=True)
+    t.start()
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    while not stop.is_set() and (t.is_alive() or a.stay):
+        stop.wait(0.5)
+    feed.stop()
+    if engine.positions:
+        print("Closing open positions before exit...")
+        engine.kill("server stopped", flatten=True, by="server")
+    server.stop()
+    print(json.dumps(engine.summary(), indent=2))
+
+
+def cmd_groww(a, cfg):
+    import os
+    from datetime import datetime, timedelta
+
+    from .broker.groww import GrowwClient, client_from_env, save_cached_token
+
+    if a.groww_cmd == "login":
+        key = os.environ.get("GROWW_API_KEY")
+        if not key:
+            sys.exit("set GROWW_API_KEY in your environment first")
+        c = GrowwClient()
+        if a.totp:
+            info = c.login_with_totp(key, a.totp)
+        else:
+            secret = os.environ.get("GROWW_API_SECRET")
+            if not secret:
+                sys.exit("give --totp CODE, or set GROWW_API_SECRET")
+            info = c.login_with_secret(key, secret)
+        save_cached_token(info)
+        print(f"Logged in. Token cached in state/ until {info.get('expiry', '6:00 AM tomorrow')}.")
+        return
+    client = client_from_env()
+    if a.groww_cmd == "ltp":
+        print(json.dumps(client.ltp(a.symbols.split(",")), indent=2))
+    elif a.groww_cmd == "history":
+        end = datetime.now().replace(second=0, microsecond=0)
+        bars = []
+        for sym in a.symbols.split(","):
+            stop = end
+            left = a.days
+            while left > 0:  # 1-minute candles: at most 30 days per request
+                span = min(left, 28)
+                start = stop - timedelta(days=span)
+                bars += client.candles(sym, start, stop, a.interval)
+                stop, left = start, left - span
+        bars = sorted({(b.timestamp, b.symbol): b for b in bars}.values(), key=lambda b: (b.timestamp, b.symbol))
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        write_csv(bars, a.out)
+        print(f"Wrote {len(bars):,} real bars to {a.out}")
+    elif a.groww_cmd == "positions":
+        print(json.dumps(client.positions(), indent=2))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="daytrader")
     p.add_argument("--config", help="config JSON (default config/config.json, else the example)")
@@ -117,10 +234,35 @@ def main(argv=None):
             b.add_argument("--trades-out", help="write every trade to this CSV")
             b.add_argument("--json", action="store_true")
 
+    sv = sub.add_parser("serve", help="run the live engine and approval server (paper by default)")
+    sv.add_argument("--feed", choices=["replay", "groww"], default="replay")
+    sv.add_argument("--data", help="CSV of bars for --feed replay")
+    sv.add_argument("--speed", type=float, default=10.0, help="replay speed (10 = 10x real time)")
+    sv.add_argument("--loop", action="store_true", help="replay the data again when it ends")
+    sv.add_argument("--stay", action="store_true", help="keep serving after the replay ends")
+    sv.add_argument("--symbols", help="comma-separated watchlist for --feed groww")
+    sv.add_argument("--host", default="127.0.0.1", help="use your Tailscale IP for the phone")
+    sv.add_argument("--port", type=int, default=8765)
+    sv.add_argument("--print-token", action="store_true")
+    sv.add_argument("--live", action="store_true", help="REAL orders (also needs mode live in config)")
+
+    g = sub.add_parser("groww", help="Groww account tools")
+    gs = g.add_subparsers(dest="groww_cmd", required=True)
+    gl = gs.add_parser("login", help="get today's access token (key + secret, or TOTP)")
+    gl.add_argument("--totp")
+    gp = gs.add_parser("ltp", help="last prices")
+    gp.add_argument("--symbols", required=True)
+    gh = gs.add_parser("history", help="download real candles to CSV for backtests")
+    gh.add_argument("--symbols", required=True)
+    gh.add_argument("--days", type=int, default=60)
+    gh.add_argument("--interval", default="1minute")
+    gh.add_argument("--out", default="data/groww_bars.csv")
+    gs.add_parser("positions", help="today's positions at Groww")
+
     a = p.parse_args(argv)
     cfg = load_config(a.config)
     {"costs": cmd_costs, "sample-data": cmd_sample, "backtest": cmd_backtest,
-     "compare": cmd_compare}[a.cmd](a, cfg)
+     "compare": cmd_compare, "serve": cmd_serve, "groww": cmd_groww}[a.cmd](a, cfg)
     return 0
 
 

@@ -1,6 +1,12 @@
 {
   "_readme": "Copy to config/config.json and edit. config.json is git-ignored. Never put API keys or passwords in this file: they go in environment variables on your server.",
   "mode": "paper",
+  "engine": {
+    "approval_ttl": 60,
+    "max_drift_pct": 0.3,
+    "state_dir": "state",
+    "tick_every": 1.0
+  },
   "strategy": {
     "name": "orb",
     "params": {

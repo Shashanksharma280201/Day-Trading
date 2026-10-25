@@ -11,4 +11,5 @@ config/config.json
 # market data and results can be large and are yours
 data/
 results/
+state/
 *.log

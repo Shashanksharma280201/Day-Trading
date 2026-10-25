@@ -15,10 +15,52 @@ Pure Python standard library. Nothing to install. Paper trading by default.
 | Phase | What | Status |
 | --- | --- | --- |
 | 1 | Cost model, NSE calendar, risk guardrails, strategies, backtester, paper broker | **done** |
-| 2 | Live data and order connector (OpenAlgo, then direct Kite Connect / DhanHQ / Groww) in paper mode | next |
-| 3 | Engine that runs the strategy all day on a VPS with a static IP, with broker-side stops | after 2 |
-| 4 | Claude skills for India: morning watchlist, NSE/BSE announcements, insider and bulk deals, end-of-day review | after 3 |
-| 5 | Live trading with a small amount, only after 1 to 3 months of profitable paper results | your call |
+| 2 | Groww connector, live engine with your approval on every entry, approval and portfolio server | **done** |
+| 3 | Dynamic Island "Trading" package: P&L on the capsule, approval cards, portfolio tab, kill switch | next |
+| 4 | Android app: same cards, live notification with Approve / Reject buttons | after 3 |
+| 5 | Weeks of paper trading, then live with a small amount only if the numbers justify it | your call |
+
+## Live engine and approvals
+
+```
+strategy signal ──> PROPOSAL ──> your tap (island or phone) ──> risk re-check ──> order
+                       │
+                       └── no answer in 60 s, or price moved > 0.3%  ──> no trade
+exits (stop, target, 15:10 square-off, daily loss limit) ──> automatic, never wait for you
+```
+
+```bash
+# try the whole flow offline, any day of the week (replay of bars at 10x speed)
+python3 -m daytrader.cli serve --feed replay --data data/sample.csv --speed 10 --print-token
+
+# paper trading on live Groww prices (needs a Groww Trade API subscription)
+export GROWW_API_KEY=...  GROWW_API_SECRET=...   # or: daytrader groww login --totp 123456
+python3 -m daytrader.cli serve --feed groww --symbols RELIANCE,INFY,HDFCBANK
+
+# download real 1-minute candles for backtests
+python3 -m daytrader.cli groww history --symbols RELIANCE,INFY --days 60 --out data/real.csv
+```
+
+The server listens on `127.0.0.1:8765`. Clients authenticate with the token
+in `state/api_token`:
+
+| Endpoint | What |
+| --- | --- |
+| `GET /api/health` | is it up (no token) |
+| `GET /api/state` | P&L, positions, approvals waiting, today's trades |
+| `GET /api/events` | live stream (Server-Sent Events): `proposal`, `proposal_update`, `position_opened`, `position_closed`, `tick`, `killed`, `alert` |
+| `POST /api/proposals/<id>/approve` | `{"device": "island"}`; the first answer wins |
+| `POST /api/proposals/<id>/reject` | |
+| `POST /api/kill` | `{"reason": "...", "flatten": true}` stops trading for the day |
+
+**Paper by default.** Real orders need BOTH `"mode": "live"` in
+`config/config.json` AND the `--live` flag. In live mode every entry also
+places an SL-M stop at Groww, so a crash cannot leave a position unprotected,
+and market orders go out as protected limit orders (1% band). Before going
+live, the machine must use the static IP you registered with Groww.
+
+Groww keys stay in environment variables on your laptop. Devices only ever
+hold the server token.
 
 ## Quick start
 
@@ -59,7 +101,10 @@ Bar start times in IST. Export it from your broker's historical data API.
 | `daytrader/strategies/` | `orb` (opening range breakout) and `vwap` (VWAP cross). Strategies only propose entries; exits are the engine's job |
 | `daytrader/backtest.py` | Next-bar-open fills, slippage, stop assumed before target in the same bar, gap fills at the open, forced square-off, full charges |
 | `daytrader/report.py` | Net P&L, costs, win rate, profit factor, drawdown, profitable days |
-| `daytrader/broker/` | Broker interface and a paper broker. Live connectors plug in here |
+| `daytrader/broker/` | Broker interface, paper broker, and the Groww connector (`groww.py`) |
+| `daytrader/engine.py` | Live engine: proposals, approvals, drift and expiry checks, automatic exits, kill switch, audit log in `state/` |
+| `daytrader/feeds.py` | Replay feed (offline testing) and Groww feed (1-minute candles plus LTP polling) |
+| `daytrader/server/` | Approval and portfolio server for the island and the phone |
 
 ## Default risk rules
 
