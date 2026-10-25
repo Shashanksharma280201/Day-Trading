@@ -131,11 +131,16 @@ def cmd_serve(a, cfg):
 
     engine = Engine(strat, risk, broker, ecfg, charges)
     token = load_or_create_token(ecfg.state_dir)
-    server = ApprovalServer(engine, token, a.host, a.port)
+    server = ApprovalServer(engine, token, a.host, a.port, a.phone_host)
     server.start()
     host, port = server.address
     print(f"Mode: {ecfg.mode.upper()}  feed: {a.feed}  strategy: {strat.name}")
     print(f"Approval server: http://{host}:{port}  (token in {ecfg.state_dir}/api_token)")
+    if server.phone_url:
+        from .server.view import manifest
+        print(f"Phone: {server.phone_url}")
+        print(f"Pair the Android app with this link (or scan the QR in the island's Settings):")
+        print(f"  {manifest(server.phone_url, token)['pairing_link']}")
     print(f"Approvals expire after {ecfg.approval_ttl:g}s; stale if price moves over {ecfg.max_drift_pct}%.")
     if a.print_token:
         print(f"Token: {token}")
@@ -243,6 +248,7 @@ def main(argv=None):
     sv.add_argument("--symbols", help="comma-separated watchlist for --feed groww")
     sv.add_argument("--host", default="127.0.0.1", help="use your Tailscale IP for the phone")
     sv.add_argument("--port", type=int, default=8765)
+    sv.add_argument("--phone-host", help="also listen here for the phone: your laptop's Tailscale IP (100.x.y.z)")
     sv.add_argument("--print-token", action="store_true")
     sv.add_argument("--live", action="store_true", help="REAL orders (also needs mode live in config)")
 

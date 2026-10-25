@@ -10,6 +10,14 @@ Clients (the Dynamic Island's Trading package, the Android app) use:
     POST /api/proposals/<id>/reject         body {"device": ...}
     POST /api/kill                          body {"reason": "...", "flatten": false}
 
+The island and the phone use the view protocol (docs/island-protocol.md):
+
+    GET  /island/manifest                   who this is, and the phone pairing link
+    GET  /island/view                       what to show (status, approval cards, sections)
+    GET  /island/events                     SSE: "view" whenever it changes, "notify" for heads-ups
+    POST /island/answer                     {"ask_id", "answer": "approve" | "reject", "device"}
+    POST /island/action                     {"action_id": "stop_today" | "flatten", "device"}
+
 Every /api route except /health needs the token: header "Authorization:
 Bearer <token>" (or ?token=<token> for EventSource clients that cannot set
 headers). The token is created on first start in state/api_token and is the
@@ -29,12 +37,14 @@ import queue
 import re
 import secrets
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ..engine import Engine
+from .view import build_view, manifest, notification_for
 
 PROPOSAL_ROUTE = re.compile(r"^/api/proposals/([0-9a-f]{8})/(approve|reject)$")
 MAX_BODY = 16 * 1024
@@ -52,27 +62,42 @@ def load_or_create_token(state_dir: str = "state") -> str:
 
 
 class ApprovalServer:
-    def __init__(self, engine: Engine, token: str, host: str = "127.0.0.1", port: int = 8765):
+    """Serves the same API on one or more addresses: 127.0.0.1 for the island,
+    and optionally your Tailscale address for the phone (phone_host)."""
+
+    def __init__(self, engine: Engine, token: str, host: str = "127.0.0.1", port: int = 8765,
+                 phone_host: str | None = None):
         self.engine = engine
         self.token = token
-        self.httpd = ThreadingHTTPServer((host, port), self._handler())
-        self.httpd.daemon_threads = True
-        self._thread: threading.Thread | None = None
+        handler = self._handler()
+        self.servers = [ThreadingHTTPServer((host, port), handler)]
+        port = self.servers[0].server_address[1]
+        if phone_host and phone_host != host:
+            self.servers.append(ThreadingHTTPServer((phone_host, port), handler))
+        for s in self.servers:
+            s.daemon_threads = True
+        self.phone_url = f"http://{phone_host}:{port}" if phone_host else None
+
+    @property
+    def httpd(self) -> ThreadingHTTPServer:
+        return self.servers[0]
 
     @property
     def address(self) -> tuple[str, int]:
-        return self.httpd.server_address[:2]
+        return self.servers[0].server_address[:2]
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self._thread.start()
+        for s in self.servers:
+            threading.Thread(target=s.serve_forever, daemon=True).start()
 
     def stop(self) -> None:
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        for s in self.servers:
+            s.shutdown()
+            s.server_close()
 
     def _handler(self):
         engine, token = self.engine, self.token
+        outer = self
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "daytrader"
@@ -122,6 +147,12 @@ class ApprovalServer:
                     return self._json(200, engine.state())
                 if path == "/api/events":
                     return self._events()
+                if path == "/island/manifest":
+                    return self._json(200, manifest(outer.phone_url, token))
+                if path == "/island/view":
+                    return self._json(200, build_view(engine.state()))
+                if path == "/island/events":
+                    return self._island_events()
                 self._json(404, {"ok": False, "error": "not found"})
 
             def do_POST(self):
@@ -142,6 +173,24 @@ class ApprovalServer:
                 if path == "/api/kill":
                     reason = str(body.get("reason") or f"stopped from {device}")[:200]
                     return self._json(200, engine.kill(reason, flatten=bool(body.get("flatten")), by=device))
+                if path == "/island/answer":
+                    pid, answer = str(body.get("ask_id", "")), body.get("answer")
+                    if answer not in ("approve", "reject"):
+                        return self._json(400, {"ok": False, "message": "answer must be approve or reject"})
+                    res = engine.approve(pid, by=device) if answer == "approve" else engine.reject(pid, by=device)
+                    msg = (res.get("proposal") or {}).get("note") or res.get("error", "")
+                    if answer == "reject" and res.get("proposal", {}).get("status") == "rejected":
+                        return self._json(200, {"ok": True, "message": "Skipped"})
+                    return self._json(200, {"ok": bool(res.get("ok")), "message": msg})
+                if path == "/island/action":
+                    action = body.get("action_id")
+                    if action == "stop_today":
+                        engine.kill(f"stopped from {device}", flatten=False, by=device)
+                        return self._json(200, {"ok": True, "message": "No new trades today"})
+                    if action == "flatten":
+                        engine.kill(f"closed everything from {device}", flatten=True, by=device)
+                        return self._json(200, {"ok": True, "message": "Closed everything; stopped for today"})
+                    return self._json(400, {"ok": False, "message": "unknown action"})
                 self._json(404, {"ok": False, "error": "not found"})
 
             def _events(self):
@@ -168,6 +217,45 @@ class ApprovalServer:
                         except queue.Empty:
                             self.wfile.write(b": keepalive\n\n")
                             self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    engine.unsubscribe(listener)
+
+            def _island_events(self):
+                """'view' on connect and whenever something changes (ticks at most
+                once a second), plus 'notify' for events worth a heads-up."""
+                q: queue.Queue = queue.Queue(maxsize=1000)
+
+                def listener(ev):
+                    try:
+                        q.put_nowait(ev)
+                    except queue.Full:
+                        pass
+
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                engine.subscribe(listener)
+                last_view = 0.0
+                try:
+                    self._send_event({"type": "view", "data": build_view(engine.state())})
+                    while True:
+                        try:
+                            ev = q.get(timeout=15)
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            continue
+                        note = notification_for(ev)
+                        if note:
+                            self._send_event({"type": "notify", "data": note})
+                        now = time.monotonic()
+                        if ev["type"] != "tick" or now - last_view >= 1.0:
+                            last_view = now
+                            self._send_event({"type": "view", "data": build_view(engine.state())})
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 finally:

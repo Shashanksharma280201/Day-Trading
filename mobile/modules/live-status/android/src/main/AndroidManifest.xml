@@ -1,0 +1,17 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <application>
+    <!-- Keeps the app connected to your trading engine during market hours, with
+         today's P&L as an ongoing notification. Started only while the app is open. -->
+    <service
+      android:name=".LiveStatusService"
+      android:exported="false"
+      android:foregroundServiceType="specialUse">
+      <property
+        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        android:value="Live connection to the user's own trading engine so trade approvals arrive within seconds" />
+    </service>
+  </application>
+</manifest>

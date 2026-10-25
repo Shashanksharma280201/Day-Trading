@@ -178,3 +178,104 @@ class TestServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIslandProtocol(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.engine = Engine(OpeningRangeBreakout(), RiskConfig(capital=100_000, max_position_pct=50),
+                             PaperBroker(100_000, slippage_bps=0), EngineConfig(state_dir=self.tmp.name))
+        self.server = ApprovalServer(self.engine, "tok", port=0, phone_host="127.0.0.2")
+        self.server.start()
+        self.base = "http://%s:%d" % self.server.address
+
+    def tearDown(self):
+        self.server.stop()
+        self.tmp.cleanup()
+
+    def call(self, method, path, body=None, base=None):
+        req = urllib.request.Request((base or self.base) + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Authorization": "Bearer tok"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+
+    def test_manifest_has_pairing_link(self):
+        m = self.call("GET", "/island/manifest")
+        self.assertEqual(m["protocol"], 1)
+        self.assertTrue(m["pairing_link"].startswith("daytrader://pair?url=http%3A%2F%2F127.0.0.2%3A"))
+        self.assertIn("token=tok", m["pairing_link"])
+
+    def test_phone_listener_serves_same_engine(self):
+        phone = self.server.phone_url
+        self.assertEqual(self.call("GET", "/island/view", base=phone)["protocol"], 1)
+
+    def test_view_and_answer_flow(self):
+        v = self.call("GET", "/island/view")
+        self.assertFalse(v["status"]["show"])
+        self.assertEqual(v["asks"], [])
+        for b in orb_bars():
+            self.engine.on_bar(b)
+        v = self.call("GET", "/island/view")
+        ask = v["asks"][0]
+        self.assertTrue(ask["title"].startswith("Buy "))
+        self.assertGreater(ask["seconds_left"], 0)
+        self.assertTrue(v["status"]["show"])
+        res = self.call("POST", "/island/answer", {"ask_id": ask["id"], "answer": "approve", "device": "island"})
+        self.assertTrue(res["ok"], res)
+        v = self.call("GET", "/island/view")
+        self.assertEqual(v["asks"], [])
+        open_rows = next(s for s in v["sections"] if s.get("title") == "Open positions")["rows"]
+        self.assertEqual(len(open_rows), 1)
+        res = self.call("POST", "/island/answer", {"ask_id": ask["id"], "answer": "approve", "device": "android"})
+        self.assertFalse(res["ok"])
+
+    def test_skip_and_actions(self):
+        for b in orb_bars():
+            self.engine.on_bar(b)
+        ask = self.call("GET", "/island/view")["asks"][0]
+        self.assertEqual(self.call("POST", "/island/answer", {"ask_id": ask["id"], "answer": "reject"})["message"], "Skipped")
+        self.assertTrue(self.call("POST", "/island/action", {"action_id": "stop_today", "device": "android"})["ok"])
+        v = self.call("GET", "/island/view")
+        self.assertEqual(v["status"]["tone"], "warn")
+        self.assertEqual(v["sections"][0]["type"], "note")
+
+    def test_island_event_stream(self):
+        resp = urllib.request.urlopen(self.base + "/island/events?token=tok", timeout=5)
+        events = []
+
+        def read():
+            cur = None
+            for raw in resp:
+                line = raw.decode()
+                if line.startswith("event: "):
+                    cur = line[7:].strip()
+                elif line.startswith("data: "):
+                    events.append((cur, json.loads(line[6:])))
+                    if cur == "view" and events[-1][1]["data"]["asks"]:
+                        break
+
+        t = threading.Thread(target=read, daemon=True)
+        t.start()
+        for b in orb_bars():
+            self.engine.on_bar(b)
+        t.join(5)
+        resp.close()
+        self.assertEqual(events[0][0], "view")
+        self.assertTrue(events[-1][1]["data"]["asks"])
+
+
+class TestViewFormatting(unittest.TestCase):
+    def test_inr(self):
+        from daytrader.server.view import inr
+        self.assertEqual(inr(1234567.8), "₹12,34,567.80")
+        self.assertEqual(inr(999), "₹999.00")
+        self.assertEqual(inr(-1240, sign=True), "−₹1,240.00")
+        self.assertEqual(inr(50, sign=True), "+₹50.00")
+
+    def test_short(self):
+        from daytrader.server.view import short_inr
+        self.assertEqual(short_inr(640.4), "+₹640")
+        self.assertEqual(short_inr(-1240), "−₹1.2k")
+        self.assertEqual(short_inr(345000), "+₹3.5L")
+        self.assertEqual(short_inr(0), "₹0")

@@ -16,9 +16,11 @@ Pure Python standard library. Nothing to install. Paper trading by default.
 | --- | --- | --- |
 | 1 | Cost model, NSE calendar, risk guardrails, strategies, backtester, paper broker | **done** |
 | 2 | Groww connector, live engine with your approval on every entry, approval and portfolio server | **done** |
-| 3 | Dynamic Island "Trading" package: P&L on the capsule, approval cards, portfolio tab, kill switch | next |
-| 4 | Android app: same cards, live notification with Approve / Reject buttons | after 3 |
+| 3 | Dynamic Island "Connected" package: P&L on the capsule, approval cards, Trading tab, kill switch | **done** |
+| 4 | Android app: same view, live notification, Buy / Skip buttons on trade notifications | **done** (build it once, see `mobile/README.md`) |
 | 5 | Weeks of paper trading, then live with a small amount only if the numbers justify it | your call |
+
+**Start here: [docs/SETUP.md](docs/SETUP.md)** (engine, island and phone, step by step).
 
 ## Live engine and approvals
 
@@ -32,6 +34,9 @@ exits (stop, target, 15:10 square-off, daily loss limit) ──> automatic, neve
 ```bash
 # try the whole flow offline, any day of the week (replay of bars at 10x speed)
 python3 -m daytrader.cli serve --feed replay --data data/sample.csv --speed 10 --print-token
+
+# reachable from your phone too, over Tailscale
+python3 -m daytrader.cli serve --feed replay --data data/sample.csv --phone-host 100.101.102.103
 
 # paper trading on live Groww prices (needs a Groww Trade API subscription)
 export GROWW_API_KEY=...  GROWW_API_SECRET=...   # or: daytrader groww login --totp 123456
@@ -49,6 +54,7 @@ in `state/api_token`:
 | `GET /api/health` | is it up (no token) |
 | `GET /api/state` | P&L, positions, approvals waiting, today's trades |
 | `GET /api/events` | live stream (Server-Sent Events): `proposal`, `proposal_update`, `position_opened`, `position_closed`, `tick`, `killed`, `alert` |
+| `/island/*` | the view protocol for the Dynamic Island and the phone ([docs/island-protocol.md](docs/island-protocol.md)) |
 | `POST /api/proposals/<id>/approve` | `{"device": "island"}`; the first answer wins |
 | `POST /api/proposals/<id>/reject` | |
 | `POST /api/kill` | `{"reason": "...", "flatten": true}` stops trading for the day |
@@ -104,7 +110,9 @@ Bar start times in IST. Export it from your broker's historical data API.
 | `daytrader/broker/` | Broker interface, paper broker, and the Groww connector (`groww.py`) |
 | `daytrader/engine.py` | Live engine: proposals, approvals, drift and expiry checks, automatic exits, kill switch, audit log in `state/` |
 | `daytrader/feeds.py` | Replay feed (offline testing) and Groww feed (1-minute candles plus LTP polling) |
-| `daytrader/server/` | Approval and portfolio server for the island and the phone |
+| `daytrader/server/` | Approval and portfolio server; `view.py` decides everything the island and the phone show |
+| `mobile/` | The Android app (Expo): pairing, the same view, notifications with Buy / Skip |
+| `docs/island-protocol.md` | The view protocol the island and the phone speak |
 
 ## Default risk rules
 
